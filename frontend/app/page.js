@@ -241,7 +241,7 @@ export default function Home() {
 
       {/* ── Header ──────────────────────────────────────────────── */}
       <header className="header">
-        <h1 className="header__logo">🧾 POS Invoice Generator</h1>
+        <h1 className="header__logo">POS Invoice Generator</h1>
         <p className="header__subtitle">
           Create &amp; download professional PDF invoices in seconds
         </p>
@@ -267,7 +267,7 @@ export default function Home() {
 
       {/* ── Customer Info Card ──────────────────────────────────── */}
       <div className="card">
-        <div className="card__title">👤 Customer Information</div>
+        <div className="card__title">Customer Information</div>
         <div className="form-group">
           <label className="form-label" htmlFor="customerName">
             Customer Name
@@ -283,11 +283,10 @@ export default function Home() {
         </div>
       </div>
 
-      <hr className="section-divider" />
 
       {/* ── Add Product Card ────────────────────────────────────── */}
       <div className="card">
-        <div className="card__title">📦 Add Products</div>
+        <div className="card__title">Add Products</div>
 
         <div className="product-entry">
           {/* Product name input */}
@@ -345,23 +344,21 @@ export default function Home() {
           <button
             className="btn btn--secondary"
             onClick={handleAddProduct}
-            title="Add this product to the invoice"
           >
-            ➕ Add
+            Add Item
           </button>
         </div>
       </div>
 
-      <hr className="section-divider" />
+
 
       {/* ── Product List Card ───────────────────────────────────── */}
       <div className="card">
-        <div className="card__title">🧾 Invoice Items</div>
+        <div className="card__title">Invoice Items</div>
 
         {/* Show empty state or product table */}
         {items.length === 0 ? (
           <div className="empty-state">
-            <div className="empty-state__icon">📋</div>
             <p>No products added yet. Use the form above to add items.</p>
           </div>
         ) : (
@@ -397,7 +394,7 @@ export default function Home() {
                           onClick={() => handleRemoveProduct(item.id)}
                           title="Remove this item"
                         >
-                          🗑️
+                          ✕
                         </button>
                       </td>
                     </tr>
@@ -435,7 +432,7 @@ export default function Home() {
               Generating PDF…
             </>
           ) : (
-            "🧾  Generate Invoice & Download PDF"
+            "Generate Invoice"
           )}
         </button>
 
