@@ -1,12 +1,20 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 /**
  * Backend API base URL.
  * Make sure your FastAPI server is running on this port.
  */
 const API_URL = "http://localhost:8000";
+
+// Mirror of backend `_PHONE_RE` — keep both in sync.
+const PHONE_RE = /^\+?[1-9]\d{7,14}$/;
+
+// Frontend never talks to Kodryx directly; it only polls our own backend
+// for the delivery status the backend recorded after handing off to Kodryx.
+const DELIVERY_POLL_INTERVAL_MS = 3000;
+const DELIVERY_POLL_MAX_ATTEMPTS = 10;
 
 export default function Home() {
   // ═══════════════════════════════════════════════════════════════
@@ -19,6 +27,8 @@ export default function Home() {
 
   // Invoice form fields
   const [customerName, setCustomerName] = useState("");
+  const [customerPhone, setCustomerPhone] = useState("");
+  const [sendViaWhatsapp, setSendViaWhatsapp] = useState(true);
   const [productName, setProductName] = useState("");
   const [quantity, setQuantity] = useState("");
   const [price, setPrice] = useState("");
@@ -29,6 +39,15 @@ export default function Home() {
   // UI state for loading and notifications
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [toast, setToast] = useState(null); // { type: "success" | "error", message: string }
+
+  // WhatsApp delivery indicator (non-blocking — merchant download is independent)
+  const [deliveryStatus, setDeliveryStatus] = useState(null); // see mapDeliveryStatus
+  const [currentInvoiceId, setCurrentInvoiceId] = useState(null);
+  const pollControlRef = useRef({ aborted: true, timer: null });
+
+  const phoneTrimmed = customerPhone.trim();
+  const phoneValid = PHONE_RE.test(phoneTrimmed);
+  const phoneHasError = sendViaWhatsapp && phoneTrimmed !== "" && !phoneValid;
 
   // ═══════════════════════════════════════════════════════════════
   // Check if backend is running (on page load)
@@ -62,6 +81,72 @@ export default function Home() {
       return () => clearTimeout(timer);
     }
   }, [toast]);
+
+  // Cancel any in-flight delivery poller when the component unmounts.
+  useEffect(() => {
+    return () => {
+      pollControlRef.current.aborted = true;
+      if (pollControlRef.current.timer) {
+        clearTimeout(pollControlRef.current.timer);
+      }
+    };
+  }, []);
+
+  // ═══════════════════════════════════════════════════════════════
+  // Delivery status helpers
+  // ═══════════════════════════════════════════════════════════════
+  function mapDeliveryStatus(apiStatus) {
+    // Mirrors backend kodryx_delivery_log.status values.
+    switch (apiStatus) {
+      case "initiated":
+        return { key: "initiated", label: "WhatsApp delivery initiated", tone: "warning" };
+      case "sent":
+        return { key: "sent", label: "WhatsApp delivery sent", tone: "success" };
+      case "failed":
+        return { key: "failed", label: "WhatsApp delivery failed", tone: "danger" };
+      case "skipped":
+        return { key: "skipped", label: "WhatsApp delivery skipped", tone: "muted" };
+      case "not_requested":
+        return { key: "not_requested", label: "WhatsApp delivery not requested", tone: "muted" };
+      default:
+        return { key: "initiated", label: "WhatsApp delivery initiated", tone: "warning" };
+    }
+  }
+
+  async function pollDeliveryStatus(invoiceId) {
+    // Cancel any prior poller so a fast second submit can't leak timers.
+    pollControlRef.current.aborted = true;
+    if (pollControlRef.current.timer) {
+      clearTimeout(pollControlRef.current.timer);
+    }
+    const control = { aborted: false, timer: null };
+    pollControlRef.current = control;
+
+    let attempts = 0;
+    const terminal = new Set(["sent", "failed", "skipped"]);
+
+    async function tick() {
+      if (control.aborted) return;
+      attempts += 1;
+      try {
+        const res = await fetch(
+          `${API_URL}/invoice-delivery-status/${invoiceId}`,
+        );
+        if (!control.aborted && res.ok) {
+          const data = await res.json();
+          setDeliveryStatus(mapDeliveryStatus(data.status));
+          if (terminal.has(data.status)) return;
+        }
+      } catch {
+        // Polling errors are non-fatal — merchant copy is unaffected.
+      }
+      if (!control.aborted && attempts < DELIVERY_POLL_MAX_ATTEMPTS) {
+        control.timer = setTimeout(tick, DELIVERY_POLL_INTERVAL_MS);
+      }
+    }
+
+    control.timer = setTimeout(tick, DELIVERY_POLL_INTERVAL_MS);
+  }
 
   // ═══════════════════════════════════════════════════════════════
   // Helper: Show a toast notification
@@ -140,6 +225,20 @@ export default function Home() {
       return;
     }
 
+    // Phone is required when WhatsApp delivery is on.
+    if (sendViaWhatsapp && !phoneValid) {
+      showToast("error", "Enter a valid customer phone (e.g. +919876543210).");
+      return;
+    }
+
+    // Reset any previous delivery indicator so a new run starts clean.
+    pollControlRef.current.aborted = true;
+    if (pollControlRef.current.timer) {
+      clearTimeout(pollControlRef.current.timer);
+    }
+    setDeliveryStatus(null);
+    setCurrentInvoiceId(null);
+
     // Show loading state
     setIsSubmitting(true);
 
@@ -150,6 +249,8 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           customer_name: customerName.trim(),
+          customer_phone: sendViaWhatsapp ? phoneTrimmed : null,
+          send_via_whatsapp: sendViaWhatsapp,
           items: items.map((item) => ({
             product_name: item.product_name,
             quantity: item.quantity,
@@ -173,6 +274,11 @@ export default function Home() {
           }
         }
 
+        // Capture the backend-assigned invoice id for delivery polling.
+        const invoiceIdHeader = res.headers.get("X-Invoice-Id");
+        const invoiceId = invoiceIdHeader ? Number(invoiceIdHeader) : null;
+        if (invoiceId) setCurrentInvoiceId(invoiceId);
+
         // Step 4: Create a download link and trigger the download
         const url = window.URL.createObjectURL(blob);
         const link = document.createElement("a");
@@ -188,8 +294,25 @@ export default function Home() {
         // Show success message
         showToast("success", `Invoice downloaded as ${filename}`);
 
+        // Step 6: Surface a non-blocking WhatsApp delivery indicator.
+        if (sendViaWhatsapp && phoneTrimmed && invoiceId) {
+          setDeliveryStatus({
+            key: "initiated",
+            label: "WhatsApp delivery initiated",
+            tone: "warning",
+          });
+          pollDeliveryStatus(invoiceId);
+        } else {
+          setDeliveryStatus({
+            key: "generated",
+            label: "Invoice generated",
+            tone: "muted",
+          });
+        }
+
         // Reset the form for the next invoice
         setCustomerName("");
+        setCustomerPhone("");
         setItems([]);
       } else {
         // Error — the backend returned an error message
@@ -280,6 +403,46 @@ export default function Home() {
             value={customerName}
             onChange={(e) => setCustomerName(e.target.value)}
           />
+        </div>
+
+        <div className="form-group">
+          <label className="form-label" htmlFor="customerPhone">
+            Customer Phone {sendViaWhatsapp && <span className="form-label__hint">(required for WhatsApp)</span>}
+          </label>
+          <input
+            id="customerPhone"
+            className={`form-input ${phoneHasError ? "form-input--error" : ""}`}
+            type="tel"
+            inputMode="tel"
+            placeholder="+919876543210"
+            value={customerPhone}
+            onChange={(e) => setCustomerPhone(e.target.value)}
+            aria-invalid={phoneHasError}
+          />
+          {phoneHasError && (
+            <p className="form-error">
+              Use international format, e.g. +919876543210.
+            </p>
+          )}
+          {!sendViaWhatsapp && (
+            <p className="form-hint">Optional — no WhatsApp delivery for this invoice.</p>
+          )}
+        </div>
+
+        <div className="form-group toggle-row">
+          <label className="toggle" htmlFor="sendViaWhatsapp">
+            <input
+              id="sendViaWhatsapp"
+              type="checkbox"
+              role="switch"
+              checked={sendViaWhatsapp}
+              onChange={(e) => setSendViaWhatsapp(e.target.checked)}
+            />
+            <span className="toggle__track" aria-hidden="true">
+              <span className="toggle__thumb" />
+            </span>
+            <span className="toggle__label">Send invoice via WhatsApp</span>
+          </label>
         </div>
       </div>
 
@@ -422,7 +585,8 @@ export default function Home() {
             backendStatus !== "online" ||
             items.length === 0 ||
             !customerName.trim() ||
-            isSubmitting
+            isSubmitting ||
+            (sendViaWhatsapp && !phoneValid)
           }
           onClick={handleGenerateInvoice}
         >
@@ -453,6 +617,35 @@ export default function Home() {
           </p>
         )}
       </div>
+
+      {/* ── Delivery Status Indicator (non-blocking) ────────────── */}
+      {deliveryStatus && (
+        <div
+          className={`delivery-status delivery-status--${deliveryStatus.tone}`}
+          role="status"
+          aria-live="polite"
+        >
+          <span className="delivery-status__dot" />
+          <div className="delivery-status__body">
+            <div className="delivery-status__label">
+              {deliveryStatus.key === "initiated" && (
+                <span className="spinner spinner--inline" />
+              )}
+              {deliveryStatus.label}
+              {currentInvoiceId && (
+                <span className="delivery-status__id">
+                  &nbsp;· Invoice #{currentInvoiceId}
+                </span>
+              )}
+            </div>
+            {deliveryStatus.key === "failed" && (
+              <div className="delivery-status__sub">
+                Merchant copy is still available locally.
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* ── Footer ──────────────────────────────────────────────── */}
       <footer className="footer">

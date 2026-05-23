@@ -10,15 +10,18 @@ Phase 3: PDF invoice generation and download
 import os
 import io
 import json
+import re
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 import psycopg
+
+from services.kodryx_client import send_invoice_to_kodryx
 
 # ── ReportLab imports for PDF generation ────────────────────────────
 from reportlab.lib.pagesizes import A4
@@ -32,6 +35,14 @@ from reportlab.lib.enums import TA_CENTER, TA_RIGHT
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+# Kodryx Social — communication infrastructure (WhatsApp delivery).
+# POS only knows the endpoint + key; all WhatsApp orchestration lives there.
+KODRYX_API_URL = os.getenv("KODRYX_API_URL")
+KODRYX_API_KEY = os.getenv("KODRYX_API_KEY")
+
+# Phone format used by both the InvoiceRequest validator and (mirrored) the frontend.
+_PHONE_RE = re.compile(r"^\+?[1-9]\d{7,14}$")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -73,6 +84,10 @@ class InvoiceRequest(BaseModel):
     """The full invoice request body."""
     customer_name: str
     items: List[InvoiceItem]
+    # POS still owns "customer data collection" — we just pass the phone
+    # straight to Kodryx for delivery, never to Meta directly.
+    customer_phone: Optional[str] = None
+    send_via_whatsapp: bool = True
 
     # Validate that customer name is not empty
     @field_validator("customer_name")
@@ -89,6 +104,30 @@ class InvoiceRequest(BaseModel):
         if len(v) == 0:
             raise ValueError("At least one product is required")
         return v
+
+    # Normalize phone format if provided.
+    @field_validator("customer_phone")
+    @classmethod
+    def normalize_phone(cls, v):
+        if v is None:
+            return None
+        v = v.strip()
+        if v == "":
+            return None
+        if not _PHONE_RE.match(v):
+            raise ValueError(
+                "customer_phone must be in E.164-like format, e.g. +919876543210"
+            )
+        return v
+
+    # Phone is required only when WhatsApp delivery is requested.
+    @model_validator(mode="after")
+    def phone_required_when_whatsapp(self):
+        if self.send_via_whatsapp and not self.customer_phone:
+            raise ValueError(
+                "customer_phone is required when send_via_whatsapp is true"
+            )
+        return self
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -111,6 +150,8 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],           # Allow all HTTP methods
     allow_headers=["*"],           # Allow all headers
+    # X-Invoice-Id lets the frontend poll delivery status after download.
+    expose_headers=["X-Invoice-Id", "Content-Disposition"],
 )
 
 
@@ -171,10 +212,37 @@ def create_tables():
             );
         """)
 
+        # Customer phone is collected by POS but used only as a Kodryx delivery
+        # address — POS never calls a WhatsApp API directly.
+        cursor.execute("""
+            ALTER TABLE pos_invoices
+            ADD COLUMN IF NOT EXISTS customer_phone VARCHAR(20);
+        """)
+
+        # Audit log for every Kodryx WhatsApp-delivery attempt. Doubles as the
+        # cross-process idempotency record (PRIMARY KEY on invoice_id).
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS kodryx_delivery_log (
+                invoice_id    INT PRIMARY KEY,
+                customer_phone VARCHAR(20),
+                status        VARCHAR(20) NOT NULL,
+                response_code INT,
+                response_body TEXT,
+                error         TEXT,
+                attempted_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+
         conn.commit()
         cursor.close()
         conn.close()
         print("Database connected & invoices table ready!")
+        if not (KODRYX_API_URL and KODRYX_API_KEY):
+            print(
+                "WARN: KODRYX_API_URL / KODRYX_API_KEY not set — "
+                "invoice generation still works, but WhatsApp delivery is disabled."
+            )
 
     except Exception as e:
         print(f"Database setup failed: {e}")
@@ -378,7 +446,7 @@ def health_check():
 
 # ── Generate Invoice endpoint ──────────────────────────────────────
 @app.post("/generate-invoice")
-def generate_invoice(invoice: InvoiceRequest):
+def generate_invoice(invoice: InvoiceRequest, background_tasks: BackgroundTasks):
     """
     Create a new invoice, save to database, generate PDF, and return it.
 
@@ -417,12 +485,13 @@ def generate_invoice(invoice: InvoiceRequest):
         # Insert the invoice into the database
         cursor.execute(
             """
-            INSERT INTO pos_invoices (customer_name, items, total_amount)
-            VALUES (%s, %s, %s)
+            INSERT INTO pos_invoices (customer_name, customer_phone, items, total_amount)
+            VALUES (%s, %s, %s, %s)
             RETURNING id, created_at;
             """,
             (
                 invoice.customer_name,
+                invoice.customer_phone,
                 json.dumps(items_with_totals),
                 grand_total,
             ),
@@ -464,13 +533,94 @@ def generate_invoice(invoice: InvoiceRequest):
             detail=f"Failed to generate PDF: {str(e)}",
         )
 
-    # ── Step 4: Return the PDF as a downloadable file ───────────────
+    # Snapshot the bytes ONCE so the same PDF can be both streamed to the
+    # merchant and uploaded to Kodryx — never regenerated.
+    pdf_bytes = pdf_buffer.getvalue()
+
+    # ── Step 4: Schedule WhatsApp delivery (fire-and-forget) ────────
+    # POS is responsible for billing + PDF only. Communication infra is
+    # delegated to Kodryx; this call runs after the HTTP response is sent
+    # and its failure can never block invoice generation or local download.
+    if invoice.send_via_whatsapp and invoice.customer_phone:
+        if KODRYX_API_URL and KODRYX_API_KEY:
+            background_tasks.add_task(
+                send_invoice_to_kodryx,
+                invoice_id=invoice_id,
+                pdf_bytes=pdf_bytes,
+                customer_name=invoice.customer_name,
+                customer_phone=invoice.customer_phone,
+                amount=grand_total,
+                db_url=DATABASE_URL,
+                kodryx_url=KODRYX_API_URL,
+                kodryx_api_key=KODRYX_API_KEY,
+            )
+        else:
+            print(
+                f"WARN: KODRYX_API_URL/KODRYX_API_KEY not set — "
+                f"WhatsApp send skipped for invoice {invoice_id}."
+            )
+
+    # ── Step 5: Return the PDF as a downloadable file ───────────────
     filename = f"invoice_{invoice_id}.pdf"
 
     return StreamingResponse(
-        pdf_buffer,
+        io.BytesIO(pdf_bytes),
         media_type="application/pdf",
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Invoice-Id": str(invoice_id),
         },
     )
+
+
+# ── Delivery status endpoint (frontend polls this) ─────────────────
+@app.get("/invoice-delivery-status/{invoice_id}")
+def get_delivery_status(invoice_id: int):
+    """
+    Return the latest Kodryx delivery state for an invoice.
+
+    Status values:
+        "not_requested" — no row (WhatsApp was not requested for this invoice)
+        "initiated"     — POS handed it to Kodryx, awaiting Kodryx response
+        "sent"          — Kodryx accepted the request (2xx)
+        "failed"        — Kodryx rejected or unreachable; merchant copy still valid
+        "skipped"       — duplicate / already-handled
+    """
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT status, response_code, error, updated_at
+              FROM kodryx_delivery_log
+             WHERE invoice_id = %s;
+            """,
+            (invoice_id,),
+        )
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to fetch delivery status: {e}",
+        )
+
+    if row is None:
+        return {
+            "invoice_id": invoice_id,
+            "status": "not_requested",
+            "response_code": None,
+            "error": None,
+            "updated_at": None,
+        }
+
+    return {
+        "invoice_id": invoice_id,
+        "status": row[0],
+        "response_code": row[1],
+        "error": row[2],
+        "updated_at": row[3].isoformat() if row[3] else None,
+    }
