@@ -1,217 +1,264 @@
-# 🧾 POS Invoice Generator — Simple Full-Stack Project
+# Kodryx POS — Invoice Generator
 
-A beginner-friendly Point-of-Sale invoice generator that creates professional PDF invoices.
+A small, branded Point-of-Sale system that takes line items, persists the
+invoice, returns a polished PDF, and (optionally) hands the **same** PDF
+off to **Kodryx Social** for WhatsApp delivery.
 
-| Layer     | Tech                  |
-| --------- | --------------------- |
-| Frontend  | Next.js (React)       |
-| Backend   | Python FastAPI        |
-| Database  | Neon PostgreSQL       |
-| PDF       | Python ReportLab      |
+| Layer    | Tech                                              |
+| -------- | ------------------------------------------------- |
+| Frontend | Next.js 16 (App Router) + React 19                |
+| Backend  | Python FastAPI + Pydantic v2                      |
+| Database | Neon PostgreSQL (auto-bootstrapped on startup)    |
+| PDF      | ReportLab 4 (in-memory, no disk writes)           |
+| Delivery | Kodryx Social — `POST /api/transactions/send`     |
 
 ---
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 POS_SYSTEM_SIMPLE/
 ├── backend/
-│   ├── main.py              # FastAPI app (API, DB, PDF generation)
-│   ├── requirements.txt     # Python dependencies
-│   ├── .env                 # Database connection string (edit this)
-│   └── .gitignore
+│   ├── main.py                       # FastAPI app: routes, models, DB
+│   ├── services/
+│   │   ├── pdf_generator.py          # PDF layout + branding config
+│   │   └── kodryx_client.py          # WhatsApp delivery (Kodryx)
+│   ├── assets/
+│   │   └── logo.png  (or .jpg/.jpeg/.webp)   # your company logo
+│   ├── requirements.txt
+│   └── .env                          # connection strings + branding
 ├── frontend/
 │   ├── app/
-│   │   ├── globals.css      # Global styles (dark glassmorphism theme)
-│   │   ├── layout.js        # Root layout
-│   │   └── page.js          # Invoice form + PDF download page
-│   ├── package.json
-│   └── ...
-└── README.md                # ← You are here
+│   │   ├── page.js                   # invoice form (client component)
+│   │   ├── layout.js
+│   │   └── globals.css               # dark glassmorphism theme
+│   └── package.json
+└── README.md
 ```
 
 ---
 
-## 🚀 Complete Setup Guide
+## Setup
 
-### Step 1: Create Neon Database
+### 1. Neon database
 
-1. Go to [https://neon.tech](https://neon.tech) and sign up (free tier available).
-2. Click **"New Project"** and create a new project.
-3. A database will be created automatically.
-4. Copy the **connection string** from the dashboard. It looks like this:
-   ```
-   postgresql://username:password@ep-xxxxx.region.neon.tech/dbname?sslmode=require
-   ```
+Sign up at [https://neon.tech](https://neon.tech), create a project, copy
+the connection string. The backend creates the `pos_invoices` and
+`kodryx_delivery_log` tables automatically on startup.
 
-> **Note:** You do NOT need to create any tables manually. The backend creates the `invoices` table automatically on startup!
-
----
-
-### Step 2: Add DATABASE_URL
-
-Open the file `backend/.env` and paste your Neon connection string:
+### 2. `backend/.env`
 
 ```env
-DATABASE_URL=postgresql://username:password@ep-xxxxx.region.neon.tech/dbname?sslmode=require
+# --- Database (required) -----------------------------------------
+DATABASE_URL=postgresql://user:pass@ep-xxxx.region.neon.tech/db?sslmode=require
+
+# --- Kodryx WhatsApp delivery (optional; PDF still generates without) ---
+KODRYX_API_URL=https://kodryx-social.example.com
+KODRYX_API_KEY=your-kodryx-key
+
+# --- Branding shown on the PDF (all optional) --------------------
+COMPANY_NAME=KODRYX AI Pvt Ltd
+COMPANY_ADDRESS=24, Banjara Hills, Hyderabad 500034
+COMPANY_PHONE=+91 98765 43210
+COMPANY_EMAIL=contact@kodryx.ai
+COMPANY_GST=36AAACA1234B1Z5
+COMPANY_WEBSITE=kodryx.ai
+COMPANY_TAGLINE=Powered by Kodryx
+# Defaults to assets/logo.png; auto-falls back to .jpg/.jpeg/.webp siblings.
+# COMPANY_LOGO_PATH=assets/logo.png
 ```
 
-Replace `username`, `password`, `ep-xxxxx.region.neon.tech`, and `dbname` with your actual values from Neon.
+> **Edit `.env`? You must restart uvicorn.** `--reload` watches `.py`
+> files, not `.env`, so env changes don't propagate without a restart.
 
----
+### 3. Logo
 
-### Step 3: Run the Backend (FastAPI)
+Drop a single file into `backend/assets/`. The PDF renderer auto-discovers
+`logo.png` → `logo.jpg` → `logo.jpeg` → `logo.webp` and embeds the first
+one it finds. PNG with a transparent background is recommended. Missing
+logo? No problem — the layout degrades gracefully.
 
-Open **Terminal 1** and run:
+### 4. Run the backend
 
 ```bash
-# Go to the backend folder
 cd backend
-
-# Create a virtual environment (first time only)
 python -m venv venv
-
-# Activate the virtual environment
-# Windows (PowerShell):
-.\venv\Scripts\Activate.ps1
-# Windows (CMD):
-.\venv\Scripts\activate.bat
-# macOS / Linux:
-source venv/bin/activate
-
-# Install dependencies (first time only)
+.\venv\Scripts\Activate.ps1        # PowerShell  (Windows)
+# source venv/bin/activate         # macOS / Linux
 pip install -r requirements.txt
-
-# Start the FastAPI server on port 8001
-uvicorn main:app --port 8001 --reload
+uvicorn main:app --port 8000 --reload
 ```
 
-You should see:
-```
-Database connected & invoices table ready!
-INFO:     Application startup complete.
-INFO:     Uvicorn running on http://127.0.0.1:8001
-```
+Health check at <http://localhost:8000>:
 
-Visit **http://localhost:8001** — you should see:
 ```json
-{
-  "status": "ok",
-  "message": "POS Invoice Generator API is running!"
-}
+{ "status": "ok", "message": "POS Invoice Generator API is running!" }
 ```
 
----
-
-### Step 4: Run the Frontend (Next.js)
-
-Open **Terminal 2** and run:
+### 5. Run the frontend
 
 ```bash
-# Go to the frontend folder
 cd frontend
-
-# Install dependencies (first time only)
 npm install
-
-# Start the Next.js dev server
 npm run dev
 ```
 
-The frontend will start at **http://localhost:3000**.
+Open <http://localhost:3000>. The status badge turns green when the
+backend health check succeeds.
 
 ---
 
-### Step 5: Test the Full Project
+## Using the app
 
-1. Open **http://localhost:3000** in your browser.
-2. You should see the green status badge: **"POS Invoice Generator API is running!"**
-3. Enter a **customer name** (e.g., "Sai").
-4. Add products:
-   - Product: Rice, Qty: 2, Price: 50 → click **Add**
-   - Product: Dal, Qty: 1, Price: 80 → click **Add**
-5. Check that the **product table** shows both items with correct totals.
-6. Check that the **grand total** shows Rs.180.00.
-7. Click **"Generate Invoice & Download PDF"**.
-8. A PDF file (`invoice_1.pdf`) will automatically download.
-9. Open the PDF — it should contain:
-   - Title: "POS INVOICE"
-   - Invoice ID, customer name, date
-   - Product table with all items
-   - Grand total at the bottom
+1. Enter a **customer name**.
+2. Enter the **customer phone** (digits-only field — see "Phone rules" below).
+3. Toggle **"Send invoice via WhatsApp"** if you want Kodryx delivery
+   (otherwise just the PDF download).
+4. Add products (name + qty + price), then **Generate Invoice**.
+5. The PDF downloads immediately. If WhatsApp delivery was requested, a
+   status indicator polls the backend until Kodryx returns `sent` or
+   `failed`. **Merchant download is independent** — even if WhatsApp
+   delivery fails, the local PDF is unaffected.
+
+### Phone rules
+
+The phone field accepts **only Indian (+91) or US (+1) mobile numbers**:
+
+* India: `+91XXXXXXXXXX` (first digit 6–9)
+* US:    `+1XXXXXXXXXX`  (area code starts 2–9)
+
+Alphabets and symbols are **blocked at the keystroke** via a native
+`beforeinput` listener (page.js:115) — they cannot appear in the field
+under any input path (physical keys, virtual keyboards, IME, autofill,
+paste). The same regex is enforced server-side in
+`InvoiceRequest.normalize_phone` (`main.py:108`).
 
 ---
 
-## 🧾 API Reference
+## PDF layout
 
-### `GET /`
-Health check endpoint.
+The first page is engineered for clean printing **and** for reliable
+WhatsApp thumbnail rendering:
 
-**Response:**
-```json
-{
-  "status": "ok",
-  "message": "POS Invoice Generator API is running!"
-}
+```
+┌────────────────────────────────────────────────┐
+│ [LOGO]                          BILLING INVOICE│
+│ KODRYX AI Pvt Ltd               Invoice #: INV-23
+│ 24, Banjara Hills, ...          Date: 25 May 2026, 02:15 PM
+│ +91 98765 43210 · contact@kodryx.ai             │
+│ GST: 36AAACA1234B1Z5                            │
+│ ───────────────────────────────────────────────│
+│ BILL TO                                         │
+│ Krishna Reddy                                   │
+│ +919876543210                                   │
+│                                                 │
+│ ┌─┬──────────┬───┬───────┬──────────┐           │
+│ │#│ Item     │Qty│ Price │ Subtotal │           │
+│ └─┴──────────┴───┴───────┴──────────┘           │
+│                       ┌───────────────────┐     │
+│                       │ Subtotal    x.xx  │     │
+│                       │ Tax         0.00  │     │
+│                       │ GRAND TOTAL x.xx  │     │
+│                       └───────────────────┘     │
+│ ───────────────────────────────────────────────│
+│        Thank you for your purchase              │
+│        Powered by Kodryx                        │
+└────────────────────────────────────────────────┘
 ```
 
-### `POST /generate-invoice`
-Create a new invoice, save to database, and return a PDF file.
+PDF metadata embedded on every render:
+`Title="Invoice INV-{id}"`, `Author="Kodryx POS"`,
+`Subject="Transactional Invoice"`, `Creator="Kodryx POS System"`.
 
-**Request Body:**
+Tax row is a `0.00` placeholder so the layout is ready for future
+taxation — current `grand_total` math is unchanged.
+
+---
+
+## API Reference
+
+### `GET /`
+Health check.
+
+### `POST /generate-invoice`
+
+Creates an invoice, persists it, generates the PDF, schedules a
+fire-and-forget Kodryx upload, and returns the PDF.
+
 ```json
 {
-  "customer_name": "Sai",
+  "customer_name": "Krishna Reddy",
+  "customer_phone": "+919876543210",
+  "send_via_whatsapp": true,
   "items": [
-    {
-      "product_name": "Rice",
-      "quantity": 2,
-      "price": 50
-    },
-    {
-      "product_name": "Dal",
-      "quantity": 1,
-      "price": 80
-    }
+    { "product_name": "Basmati Rice 5kg", "quantity": 2, "price": 550 },
+    { "product_name": "Toor Dal 1kg",     "quantity": 3, "price": 165.5 }
   ]
 }
 ```
 
-**Success Response (200):** Returns a PDF file download (`invoice_<id>.pdf`)
+Response: `application/pdf` with headers:
 
-**Error Responses:**
+* `Content-Disposition: attachment; filename="invoice_<id>.pdf"`
+* `X-Invoice-Id: <id>` — used by the frontend to poll delivery status
+
 | Code | When |
 |------|------|
-| 400  | Empty product list |
-| 422  | Invalid quantity (< 1) or price (≤ 0) |
-| 500  | Database connection, insert, or PDF generation failure |
+| 400  | empty product list |
+| 422  | invalid phone, qty &lt; 1, price ≤ 0, missing required field |
+| 500  | database or PDF failure |
+
+### `GET /invoice-delivery-status/{invoice_id}`
+
+Returns the latest Kodryx delivery state for an invoice:
+
+| Status          | Meaning |
+|-----------------|---------|
+| `not_requested` | WhatsApp delivery wasn't requested |
+| `initiated`     | Backend handed off to Kodryx, awaiting response |
+| `sent`          | Kodryx accepted (2xx) |
+| `failed`        | Kodryx rejected or unreachable |
+| `skipped`       | Duplicate / already handled |
 
 ---
 
-## ✅ Phase 1 — Basic Setup
+## Database
 
-- [x] Folder structure (`backend/` + `frontend/`)
-- [x] Backend: FastAPI basic setup with health check route `/`
-- [x] Backend: CORS configured for `http://localhost:3000`
-- [x] Frontend: Next.js project initialized
-- [x] Frontend: Beautiful home page with backend status check
-- [x] README with setup instructions
+Both tables are auto-created on uvicorn startup (`main.py:188`).
 
-## ✅ Phase 2 — Invoice Form + Database
+```sql
+pos_invoices (
+  id SERIAL PK,
+  customer_name VARCHAR(100),
+  customer_phone VARCHAR(20),
+  items JSONB,
+  total_amount NUMERIC,
+  created_at TIMESTAMP DEFAULT NOW()
+)
 
-- [x] Invoice form (customer name, products, quantity, price)
-- [x] Add/remove products with live total calculation
-- [x] API endpoint `POST /generate-invoice`
-- [x] Pydantic input validation with error handling
-- [x] Neon PostgreSQL database integration (auto-create table)
-- [x] Success/error toast notifications
-- [x] Beautiful glassmorphism UI with responsive design
+kodryx_delivery_log (
+  invoice_id INT PK,                 -- cross-process idempotency key
+  customer_phone VARCHAR(20),
+  status VARCHAR(20),                -- initiated | sent | failed | skipped
+  response_code INT,
+  response_body TEXT,                -- truncated to 500 chars
+  error TEXT,
+  attempted_at, updated_at TIMESTAMP
+)
+```
 
-## ✅ Phase 3 — PDF Generation + Download
+---
 
-- [x] PDF generation using ReportLab
-- [x] Professional PDF layout (title, customer info, product table, grand total)
-- [x] PDF returned as downloadable file from API
-- [x] Auto-download PDF in browser
-- [x] Loading spinner while generating
-- [x] Clear code comments throughout
+## Design notes
+
+* **PDF bytes are generated once and reused** for both the HTTP response
+  and the Kodryx upload — no regeneration, no disk writes.
+* **POS owns billing + PDF only.** All WhatsApp orchestration (templates,
+  retries, webhooks) lives in Kodryx; this codebase has zero Meta /
+  WhatsApp API knowledge.
+* **Two-layer idempotency for delivery:** an in-process `_in_flight` set
+  plus a DB row in `kodryx_delivery_log` keyed by `invoice_id`. Existing
+  `initiated`/`sent` rows short-circuit retries.
+* **Branding is centralized** in `COMPANY_CONFIG` (`services/pdf_generator.py:44`)
+  and driven entirely by env vars — change `.env` and restart uvicorn,
+  no code edits required.
