@@ -9,7 +9,18 @@ import { useEffect, useRef, useState } from "react";
 const API_URL = "http://localhost:8000";
 
 // Mirror of backend `_PHONE_RE` — keep both in sync.
-const PHONE_RE = /^\+?[1-9]\d{7,14}$/;
+// Allowed: India (+91 + 10-digit mobile starting 6–9) or US (+1 + 10-digit
+// number whose area code starts 2–9). Anything else is rejected.
+const PHONE_RE = /^(\+91[6-9]\d{9}|\+1[2-9]\d{9})$/;
+const PHONE_HELP = "Use +91XXXXXXXXXX (India) or +1XXXXXXXXXX (US).";
+
+// Keystroke-level keys we always allow through the phone field
+// (navigation, deletion, copy/paste shortcuts).
+const PHONE_CONTROL_KEYS = new Set([
+  "Backspace", "Delete", "Tab", "Escape", "Enter",
+  "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown",
+  "Home", "End",
+]);
 
 // Frontend never talks to Kodryx directly; it only polls our own backend
 // for the delivery status the backend recorded after handing off to Kodryx.
@@ -44,6 +55,12 @@ export default function Home() {
   const [deliveryStatus, setDeliveryStatus] = useState(null); // see mapDeliveryStatus
   const [currentInvoiceId, setCurrentInvoiceId] = useState(null);
   const pollControlRef = useRef({ aborted: true, timer: null });
+
+  // Phone input — held via ref so we can attach a NATIVE `beforeinput`
+  // listener. React's onBeforeInput is a polyfill that doesn't reliably
+  // fire for every input path (virtual keyboards, IME, some autofills);
+  // the native DOM event always fires and supports preventDefault.
+  const phoneInputRef = useRef(null);
 
   const phoneTrimmed = customerPhone.trim();
   const phoneValid = PHONE_RE.test(phoneTrimmed);
@@ -90,6 +107,27 @@ export default function Home() {
         clearTimeout(pollControlRef.current.timer);
       }
     };
+  }, []);
+
+  // Hard guarantee against alphabetic input. We attach a NATIVE
+  // `beforeinput` listener (not React's synthetic one) so the block
+  // fires for every text-insertion path the browser supports.
+  useEffect(() => {
+    const el = phoneInputRef.current;
+    if (!el) return;
+    const block = (e) => {
+      const data = e.data;
+      if (data == null) return;
+      for (let i = 0; i < data.length; i++) {
+        const ch = data[i];
+        // Allow digits + the literal "+". onChange dedupes/repositions "+".
+        if ((ch >= "0" && ch <= "9") || ch === "+") continue;
+        e.preventDefault();
+        return;
+      }
+    };
+    el.addEventListener("beforeinput", block);
+    return () => el.removeEventListener("beforeinput", block);
   }, []);
 
   // ═══════════════════════════════════════════════════════════════
@@ -153,6 +191,58 @@ export default function Home() {
   // ═══════════════════════════════════════════════════════════════
   function showToast(type, message) {
     setToast({ type, message });
+  }
+
+  // ═══════════════════════════════════════════════════════════════
+  // Phone field: hard restriction to digits (with a single leading "+").
+  // Keystroke handler blocks disallowed keys before they appear; the
+  // change handler also sanitizes any paste / IME / autofill input.
+  // Together they guarantee the field can never hold a non-numeric char.
+  // ═══════════════════════════════════════════════════════════════
+  function handlePhoneKeyDown(e) {
+    if (e.ctrlKey || e.metaKey || e.altKey) return;        // copy/paste etc.
+    if (PHONE_CONTROL_KEYS.has(e.key)) return;
+    // "Unidentified" / "Process" come from IME / virtual keyboards —
+    // let them through here; `onBeforeInput` below blocks the actual text.
+    if (e.key === "Unidentified" || e.key === "Process") return;
+    // Allow "+" only at the very start of the input.
+    if (e.key === "+" && e.target.selectionStart === 0) return;
+    // Allow digits.
+    if (/^\d$/.test(e.key)) return;
+    // Anything else (letters, symbols, spaces) is rejected at the keystroke.
+    e.preventDefault();
+  }
+
+  // Sanitize whatever survives (e.g. programmatic value changes) so the
+  // field can never display a non-numeric character.
+  function handlePhoneChange(e) {
+    let v = e.target.value;
+    if (v.startsWith("+")) {
+      v = "+" + v.slice(1).replace(/\D/g, "");
+    } else {
+      v = v.replace(/\D/g, "");
+    }
+    setCustomerPhone(v);
+  }
+
+  function handlePhonePaste(e) {
+    // Pre-clean clipboard text before it reaches onChange — this gives
+    // a clean digit-only result even when the user pastes "+91 98765 43210".
+    e.preventDefault();
+    const raw = (e.clipboardData || window.clipboardData)?.getData("text") || "";
+    let cleaned = raw.startsWith("+")
+      ? "+" + raw.slice(1).replace(/\D/g, "")
+      : raw.replace(/\D/g, "");
+    // Splice into current value at the cursor position.
+    const el = e.target;
+    const start = el.selectionStart ?? customerPhone.length;
+    const end = el.selectionEnd ?? customerPhone.length;
+    const next = customerPhone.slice(0, start) + cleaned + customerPhone.slice(end);
+    // Re-sanitize the merged string (in case "+" ended up mid-string).
+    const final = next.startsWith("+")
+      ? "+" + next.slice(1).replace(/\D/g, "")
+      : next.replace(/\D/g, "");
+    setCustomerPhone(final);
   }
 
   // ═══════════════════════════════════════════════════════════════
@@ -225,9 +315,10 @@ export default function Home() {
       return;
     }
 
-    // Phone is required when WhatsApp delivery is on.
+    // Phone is required when WhatsApp delivery is on. Only Indian (+91)
+    // and US (+1) mobile numbers are accepted.
     if (sendViaWhatsapp && !phoneValid) {
-      showToast("error", "Enter a valid customer phone (e.g. +919876543210).");
+      showToast("error", PHONE_HELP);
       return;
     }
 
@@ -413,16 +504,21 @@ export default function Home() {
             id="customerPhone"
             className={`form-input ${phoneHasError ? "form-input--error" : ""}`}
             type="tel"
-            inputMode="tel"
-            placeholder="+919876543210"
+            inputMode="numeric"
+            autoComplete="tel"
+            maxLength={13}
+            placeholder="+919876543210 or +14155551234"
+            pattern="^(\+91[6-9]\d{9}|\+1[2-9]\d{9})$"
+            title={PHONE_HELP}
+            ref={phoneInputRef}
             value={customerPhone}
-            onChange={(e) => setCustomerPhone(e.target.value)}
+            onKeyDown={handlePhoneKeyDown}
+            onPaste={handlePhonePaste}
+            onChange={handlePhoneChange}
             aria-invalid={phoneHasError}
           />
           {phoneHasError && (
-            <p className="form-error">
-              Use international format, e.g. +919876543210.
-            </p>
+            <p className="form-error">{PHONE_HELP}</p>
           )}
           {!sendViaWhatsapp && (
             <p className="form-hint">Optional — no WhatsApp delivery for this invoice.</p>

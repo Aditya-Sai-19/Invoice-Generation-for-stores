@@ -42,7 +42,8 @@ BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Override any field via env vars in backend/.env. Empty defaults keep
 # the layout clean when no branding is supplied.
 COMPANY_CONFIG = {
-    "name":      os.getenv("COMPANY_NAME", "Kodryx POS"),
+    # Empty default → no name line under the logo unless COMPANY_NAME is set.
+    "name":      os.getenv("COMPANY_NAME", ""),
     "address":   os.getenv("COMPANY_ADDRESS", ""),
     "phone":     os.getenv("COMPANY_PHONE", ""),
     "email":     os.getenv("COMPANY_EMAIL", ""),
@@ -91,7 +92,7 @@ def _resolve_logo_path() -> Optional[str]:
     return None
 
 
-def _build_logo_flowable(max_height_mm: float = 18, max_width_mm: float = 50):
+def _build_logo_flowable(max_height_mm: float = 32, max_width_mm: float = 80):
     """Return a scaled Image flowable, or None if no usable logo exists.
 
     Aspect ratio is always preserved. Reads natural dimensions via Pillow
@@ -162,7 +163,7 @@ def generate_pdf(
 
     title_style = ParagraphStyle(
         "Title", parent=base["Heading1"], fontName="Helvetica-Bold",
-        fontSize=26, leading=30, textColor=BRAND_DARK,
+        fontSize=24, leading=28, textColor=BRAND_DARK,
         alignment=TA_RIGHT, spaceAfter=4,
     )
     company_name_style = ParagraphStyle(
@@ -208,7 +209,8 @@ def generate_pdf(
     if logo is not None:
         left_block.append(logo)
         left_block.append(Spacer(1, 3 * mm))
-    left_block.append(Paragraph(COMPANY_CONFIG["name"], company_name_style))
+    if COMPANY_CONFIG["name"]:
+        left_block.append(Paragraph(COMPANY_CONFIG["name"], company_name_style))
     if COMPANY_CONFIG["address"]:
         left_block.append(Paragraph(COMPANY_CONFIG["address"], company_meta_style))
     contact_bits = []
@@ -225,14 +227,14 @@ def generate_pdf(
             f"GST: {COMPANY_CONFIG['gst']}", company_meta_style))
 
     right_block = [
-        Paragraph("POS INVOICE", title_style),
+        Paragraph("BILLING INVOICE", title_style),
         Paragraph(f"<b>Invoice #:</b> {invoice_number}", meta_label_style),
         Paragraph(f"<b>Date:</b> {created_at}", meta_label_style),
     ]
 
     header_table = Table(
         [[left_block, right_block]],
-        colWidths=[110 * mm, 64 * mm],
+        colWidths=[88 * mm, 86 * mm],
     )
     header_table.setStyle(TableStyle([
         ("VALIGN", (0, 0), (-1, -1), "TOP"),

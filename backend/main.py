@@ -15,6 +15,11 @@ from datetime import datetime
 from typing import List, Optional
 
 from dotenv import load_dotenv
+
+# ── Load .env BEFORE importing any module that reads env vars at
+#    import-time (e.g. services.pdf_generator's COMPANY_CONFIG).
+load_dotenv()
+
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -24,9 +29,6 @@ import psycopg
 from services.kodryx_client import send_invoice_to_kodryx
 from services.pdf_generator import generate_pdf
 
-# ── Load environment variables from .env ────────────────────────────
-load_dotenv()
-
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 # Kodryx Social — communication infrastructure (WhatsApp delivery).
@@ -34,8 +36,10 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 KODRYX_API_URL = os.getenv("KODRYX_API_URL")
 KODRYX_API_KEY = os.getenv("KODRYX_API_KEY")
 
-# Phone format used by both the InvoiceRequest validator and (mirrored) the frontend.
-_PHONE_RE = re.compile(r"^\+?[1-9]\d{7,14}$")
+# Phone format used by both the InvoiceRequest validator and (mirrored) the
+# frontend (`PHONE_RE` in app/page.js). Only Indian (+91 + 10-digit mobile
+# starting 6–9) or US (+1 + 10-digit number, area code starts 2–9) numbers.
+_PHONE_RE = re.compile(r"^(\+91[6-9]\d{9}|\+1[2-9]\d{9})$")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -109,7 +113,8 @@ class InvoiceRequest(BaseModel):
             return None
         if not _PHONE_RE.match(v):
             raise ValueError(
-                "customer_phone must be in E.164-like format, e.g. +919876543210"
+                "customer_phone must be a valid Indian (+91XXXXXXXXXX) "
+                "or US (+1XXXXXXXXXX) mobile number"
             )
         return v
 
