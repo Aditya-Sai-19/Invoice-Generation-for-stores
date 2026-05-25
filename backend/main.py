@@ -22,14 +22,7 @@ from pydantic import BaseModel, field_validator, model_validator
 import psycopg
 
 from services.kodryx_client import send_invoice_to_kodryx
-
-# ── ReportLab imports for PDF generation ────────────────────────────
-from reportlab.lib.pagesizes import A4
-from reportlab.lib import colors
-from reportlab.lib.units import mm
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.enums import TA_CENTER, TA_RIGHT
+from services.pdf_generator import generate_pdf
 
 # ── Load environment variables from .env ────────────────────────────
 load_dotenv()
@@ -250,181 +243,9 @@ def create_tables():
 
 
 # ═══════════════════════════════════════════════════════════════════
-# PDF Generation Helper
+# PDF generation lives in services/pdf_generator.py — branding,
+# layout, and ReportLab styling are owned there. Totals math stays here.
 # ═══════════════════════════════════════════════════════════════════
-
-def generate_pdf(invoice_id, customer_name, items_with_totals, grand_total, created_at):
-    """
-    Generate a PDF invoice using ReportLab.
-
-    Args:
-        invoice_id: The database ID of the invoice
-        customer_name: Name of the customer
-        items_with_totals: List of items with calculated totals
-        grand_total: The grand total amount
-        created_at: When the invoice was created
-
-    Returns:
-        A BytesIO buffer containing the PDF data
-    """
-
-    # Step 1: Create a buffer to hold the PDF in memory
-    buffer = io.BytesIO()
-
-    # Step 2: Create the PDF document (A4 paper size)
-    doc = SimpleDocTemplate(
-        buffer,
-        pagesize=A4,
-        rightMargin=20 * mm,
-        leftMargin=20 * mm,
-        topMargin=20 * mm,
-        bottomMargin=20 * mm,
-    )
-
-    # Step 3: Set up text styles
-    styles = getSampleStyleSheet()
-
-    # Title style — big, bold, centered
-    title_style = ParagraphStyle(
-        "InvoiceTitle",
-        parent=styles["Heading1"],
-        fontSize=22,
-        textColor=colors.HexColor("#1a1a2e"),
-        alignment=TA_CENTER,
-        spaceAfter=6 * mm,
-    )
-
-    # Subtitle style — for invoice details
-    subtitle_style = ParagraphStyle(
-        "InvoiceSubtitle",
-        parent=styles["Normal"],
-        fontSize=11,
-        textColor=colors.HexColor("#444444"),
-        alignment=TA_CENTER,
-        spaceAfter=2 * mm,
-    )
-
-    # Normal text style
-    normal_style = ParagraphStyle(
-        "InvoiceNormal",
-        parent=styles["Normal"],
-        fontSize=10,
-        textColor=colors.HexColor("#333333"),
-    )
-
-    # Grand total style — right-aligned, bold
-    total_style = ParagraphStyle(
-        "InvoiceTotal",
-        parent=styles["Normal"],
-        fontSize=13,
-        textColor=colors.HexColor("#1a1a2e"),
-        alignment=TA_RIGHT,
-        fontName="Helvetica-Bold",
-        spaceBefore=4 * mm,
-    )
-
-    # Step 4: Build the PDF content (list of elements)
-    elements = []
-
-    # --- Title ---
-    elements.append(Paragraph("POS INVOICE", title_style))
-
-    # --- Horizontal line ---
-    line_data = [["" ]]
-    line_table = Table(line_data, colWidths=[170 * mm])
-    line_table.setStyle(TableStyle([
-        ("LINEBELOW", (0, 0), (-1, 0), 1, colors.HexColor("#6366f1")),
-    ]))
-    elements.append(line_table)
-    elements.append(Spacer(1, 4 * mm))
-
-    # --- Invoice details (ID, customer, date) ---
-    elements.append(Paragraph(f"<b>Invoice ID:</b> #{invoice_id}", normal_style))
-    elements.append(Spacer(1, 2 * mm))
-    elements.append(Paragraph(f"<b>Customer:</b> {customer_name}", normal_style))
-    elements.append(Spacer(1, 2 * mm))
-    elements.append(Paragraph(f"<b>Date:</b> {created_at}", normal_style))
-    elements.append(Spacer(1, 8 * mm))
-
-    # --- Product table ---
-    # Table header row
-    table_data = [["#", "Product", "Qty", "Price", "Total"]]
-
-    # Table data rows — one row per product
-    for i, item in enumerate(items_with_totals, 1):
-        table_data.append([
-            str(i),
-            item["product_name"],
-            str(item["quantity"]),
-            f"Rs.{item['price']:.2f}",
-            f"Rs.{item['item_total']:.2f}",
-        ])
-
-    # Create the table with column widths
-    product_table = Table(
-        table_data,
-        colWidths=[12 * mm, 70 * mm, 20 * mm, 35 * mm, 35 * mm],
-    )
-
-    # Style the table (colors, borders, fonts)
-    product_table.setStyle(TableStyle([
-        # Header row styling
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#6366f1")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, 0), 10),
-        ("ALIGN", (0, 0), (-1, 0), "CENTER"),
-        ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
-        ("TOPPADDING", (0, 0), (-1, 0), 8),
-
-        # Data rows styling
-        ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
-        ("FONTSIZE", (0, 1), (-1, -1), 9),
-        ("ALIGN", (0, 1), (0, -1), "CENTER"),   # # column centered
-        ("ALIGN", (2, 1), (2, -1), "CENTER"),   # Qty column centered
-        ("ALIGN", (3, 1), (-1, -1), "RIGHT"),   # Price & Total right-aligned
-        ("TOPPADDING", (0, 1), (-1, -1), 6),
-        ("BOTTOMPADDING", (0, 1), (-1, -1), 6),
-
-        # Alternating row colors for readability
-        *[
-            ("BACKGROUND", (0, i), (-1, i), colors.HexColor("#f0f0ff"))
-            for i in range(2, len(table_data), 2)
-        ],
-
-        # Grid lines
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cccccc")),
-        ("LINEBELOW", (0, 0), (-1, 0), 1.5, colors.HexColor("#4f46e5")),
-    ]))
-
-    elements.append(product_table)
-    elements.append(Spacer(1, 6 * mm))
-
-    # --- Grand Total ---
-    elements.append(Paragraph(f"Grand Total: Rs.{grand_total:.2f}", total_style))
-    elements.append(Spacer(1, 10 * mm))
-
-    # --- Footer line ---
-    elements.append(line_table)
-    elements.append(Spacer(1, 3 * mm))
-
-    footer_style = ParagraphStyle(
-        "Footer",
-        parent=styles["Normal"],
-        fontSize=8,
-        textColor=colors.HexColor("#999999"),
-        alignment=TA_CENTER,
-    )
-    elements.append(Paragraph("Thank you for your business!", footer_style))
-    elements.append(Paragraph("Generated by POS Invoice Generator", footer_style))
-
-    # Step 5: Build the PDF
-    doc.build(elements)
-
-    # Step 6: Reset buffer position to the beginning so it can be read
-    buffer.seek(0)
-
-    return buffer
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -526,6 +347,7 @@ def generate_invoice(invoice: InvoiceRequest, background_tasks: BackgroundTasks)
             items_with_totals=items_with_totals,
             grand_total=grand_total,
             created_at=date_str,
+            customer_phone=invoice.customer_phone,
         )
     except Exception as e:
         raise HTTPException(
