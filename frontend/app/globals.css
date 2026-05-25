@@ -417,6 +417,176 @@ body {
   to { transform: rotate(360deg); }
 }
 
+/* Inline spinner used inside the delivery-status card */
+.spinner--inline {
+  width: 12px;
+  height: 12px;
+  margin-right: 0.4rem;
+  border: 2px solid rgba(217, 119, 6, 0.25);
+  border-top-color: var(--warning);
+  vertical-align: -2px;
+}
+
+/* Form helpers (used by WhatsApp phone field) */
+.form-label__hint {
+  font-weight: 400;
+  color: var(--text-muted);
+  margin-left: 0.25rem;
+}
+
+.form-hint {
+  margin-top: 0.35rem;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.form-error {
+  margin-top: 0.35rem;
+  font-size: 0.75rem;
+  color: var(--danger);
+}
+
+.form-input--error,
+.form-input--error:focus {
+  border-color: var(--danger);
+  box-shadow: 0 0 0 1px var(--danger);
+}
+
+/* Toggle switch (WhatsApp opt-in) */
+.toggle-row {
+  margin-top: 0.25rem;
+}
+
+.toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.65rem;
+  cursor: pointer;
+  user-select: none;
+}
+
+.toggle input {
+  /* Hide the native checkbox but keep it accessible. */
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.toggle__track {
+  position: relative;
+  width: 36px;
+  height: 20px;
+  background: var(--border-color);
+  border-radius: 999px;
+  transition: background var(--transition);
+  flex-shrink: 0;
+}
+
+.toggle__thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  background: #fff;
+  border-radius: 50%;
+  box-shadow: var(--shadow-sm);
+  transition: transform var(--transition);
+}
+
+.toggle input:checked + .toggle__track {
+  background: var(--accent);
+}
+
+.toggle input:checked + .toggle__track .toggle__thumb {
+  transform: translateX(16px);
+}
+
+.toggle input:focus-visible + .toggle__track {
+  box-shadow: 0 0 0 2px rgba(17, 24, 39, 0.2);
+}
+
+.toggle__label {
+  font-size: 0.875rem;
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+/* Delivery status indicator (non-blocking, shown after PDF download) */
+.delivery-status {
+  width: 100%;
+  max-width: 620px;
+  margin: 1rem auto 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 0.65rem;
+  padding: 0.75rem 1rem;
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-left-width: 4px;
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+  font-size: 0.85rem;
+}
+
+.delivery-status__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  margin-top: 0.45rem;
+  flex-shrink: 0;
+}
+
+.delivery-status__body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.delivery-status__label {
+  font-weight: 500;
+  color: var(--text-primary);
+  display: inline-flex;
+  align-items: center;
+}
+
+.delivery-status__id {
+  color: var(--text-muted);
+  font-weight: 400;
+}
+
+.delivery-status__sub {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+}
+
+.delivery-status--success {
+  border-left-color: var(--success);
+}
+.delivery-status--success .delivery-status__dot {
+  background: var(--success);
+}
+
+.delivery-status--danger {
+  border-left-color: var(--danger);
+}
+.delivery-status--danger .delivery-status__dot {
+  background: var(--danger);
+}
+
+.delivery-status--warning {
+  border-left-color: var(--warning);
+}
+.delivery-status--warning .delivery-status__dot {
+  background: var(--warning);
+}
+
+.delivery-status--muted {
+  border-left-color: var(--border-color);
+}
+
 /* Footer */
 .footer {
   margin-top: auto;

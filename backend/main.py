@@ -10,28 +10,36 @@ Phase 3: PDF invoice generation and download
 import os
 import io
 import json
+import re
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, field_validator
-import psycopg
 
-# ── ReportLab imports for PDF generation ────────────────────────────
-from reportlab.lib.pagesizes import A4
-from reportlab.lib import colors
-from reportlab.lib.units import mm
-from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.enums import TA_CENTER, TA_RIGHT
-
-# ── Load environment variables from .env ────────────────────────────
+# ── Load .env BEFORE importing any module that reads env vars at
+#    import-time (e.g. services.pdf_generator's COMPANY_CONFIG).
 load_dotenv()
 
+from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, field_validator, model_validator
+import psycopg
+
+from services.kodryx_client import send_invoice_to_kodryx
+from services.pdf_generator import generate_pdf
+
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+# Kodryx Social — communication infrastructure (WhatsApp delivery).
+# POS only knows the endpoint + key; all WhatsApp orchestration lives there.
+KODRYX_API_URL = os.getenv("KODRYX_API_URL")
+KODRYX_API_KEY = os.getenv("KODRYX_API_KEY")
+
+# Phone format used by both the InvoiceRequest validator and (mirrored) the
+# frontend (`PHONE_RE` in app/page.js). Only Indian (+91 + 10-digit mobile
+# starting 6–9) or US (+1 + 10-digit number, area code starts 2–9) numbers.
+_PHONE_RE = re.compile(r"^(\+91[6-9]\d{9}|\+1[2-9]\d{9})$")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -73,6 +81,10 @@ class InvoiceRequest(BaseModel):
     """The full invoice request body."""
     customer_name: str
     items: List[InvoiceItem]
+    # POS still owns "customer data collection" — we just pass the phone
+    # straight to Kodryx for delivery, never to Meta directly.
+    customer_phone: Optional[str] = None
+    send_via_whatsapp: bool = True
 
     # Validate that customer name is not empty
     @field_validator("customer_name")
@@ -89,6 +101,31 @@ class InvoiceRequest(BaseModel):
         if len(v) == 0:
             raise ValueError("At least one product is required")
         return v
+
+    # Normalize phone format if provided.
+    @field_validator("customer_phone")
+    @classmethod
+    def normalize_phone(cls, v):
+        if v is None:
+            return None
+        v = v.strip()
+        if v == "":
+            return None
+        if not _PHONE_RE.match(v):
+            raise ValueError(
+                "customer_phone must be a valid Indian (+91XXXXXXXXXX) "
+                "or US (+1XXXXXXXXXX) mobile number"
+            )
+        return v
+
+    # Phone is required only when WhatsApp delivery is requested.
+    @model_validator(mode="after")
+    def phone_required_when_whatsapp(self):
+        if self.send_via_whatsapp and not self.customer_phone:
+            raise ValueError(
+                "customer_phone is required when send_via_whatsapp is true"
+            )
+        return self
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -111,6 +148,8 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],           # Allow all HTTP methods
     allow_headers=["*"],           # Allow all headers
+    # X-Invoice-Id lets the frontend poll delivery status after download.
+    expose_headers=["X-Invoice-Id", "Content-Disposition"],
 )
 
 
@@ -171,10 +210,37 @@ def create_tables():
             );
         """)
 
+        # Customer phone is collected by POS but used only as a Kodryx delivery
+        # address — POS never calls a WhatsApp API directly.
+        cursor.execute("""
+            ALTER TABLE pos_invoices
+            ADD COLUMN IF NOT EXISTS customer_phone VARCHAR(20);
+        """)
+
+        # Audit log for every Kodryx WhatsApp-delivery attempt. Doubles as the
+        # cross-process idempotency record (PRIMARY KEY on invoice_id).
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS kodryx_delivery_log (
+                invoice_id    INT PRIMARY KEY,
+                customer_phone VARCHAR(20),
+                status        VARCHAR(20) NOT NULL,
+                response_code INT,
+                response_body TEXT,
+                error         TEXT,
+                attempted_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+
         conn.commit()
         cursor.close()
         conn.close()
         print("Database connected & invoices table ready!")
+        if not (KODRYX_API_URL and KODRYX_API_KEY):
+            print(
+                "WARN: KODRYX_API_URL / KODRYX_API_KEY not set — "
+                "invoice generation still works, but WhatsApp delivery is disabled."
+            )
 
     except Exception as e:
         print(f"Database setup failed: {e}")
@@ -182,181 +248,9 @@ def create_tables():
 
 
 # ═══════════════════════════════════════════════════════════════════
-# PDF Generation Helper
+# PDF generation lives in services/pdf_generator.py — branding,
+# layout, and ReportLab styling are owned there. Totals math stays here.
 # ═══════════════════════════════════════════════════════════════════
-
-def generate_pdf(invoice_id, customer_name, items_with_totals, grand_total, created_at):
-    """
-    Generate a PDF invoice using ReportLab.
-
-    Args:
-        invoice_id: The database ID of the invoice
-        customer_name: Name of the customer
-        items_with_totals: List of items with calculated totals
-        grand_total: The grand total amount
-        created_at: When the invoice was created
-
-    Returns:
-        A BytesIO buffer containing the PDF data
-    """
-
-    # Step 1: Create a buffer to hold the PDF in memory
-    buffer = io.BytesIO()
-
-    # Step 2: Create the PDF document (A4 paper size)
-    doc = SimpleDocTemplate(
-        buffer,
-        pagesize=A4,
-        rightMargin=20 * mm,
-        leftMargin=20 * mm,
-        topMargin=20 * mm,
-        bottomMargin=20 * mm,
-    )
-
-    # Step 3: Set up text styles
-    styles = getSampleStyleSheet()
-
-    # Title style — big, bold, centered
-    title_style = ParagraphStyle(
-        "InvoiceTitle",
-        parent=styles["Heading1"],
-        fontSize=22,
-        textColor=colors.HexColor("#1a1a2e"),
-        alignment=TA_CENTER,
-        spaceAfter=6 * mm,
-    )
-
-    # Subtitle style — for invoice details
-    subtitle_style = ParagraphStyle(
-        "InvoiceSubtitle",
-        parent=styles["Normal"],
-        fontSize=11,
-        textColor=colors.HexColor("#444444"),
-        alignment=TA_CENTER,
-        spaceAfter=2 * mm,
-    )
-
-    # Normal text style
-    normal_style = ParagraphStyle(
-        "InvoiceNormal",
-        parent=styles["Normal"],
-        fontSize=10,
-        textColor=colors.HexColor("#333333"),
-    )
-
-    # Grand total style — right-aligned, bold
-    total_style = ParagraphStyle(
-        "InvoiceTotal",
-        parent=styles["Normal"],
-        fontSize=13,
-        textColor=colors.HexColor("#1a1a2e"),
-        alignment=TA_RIGHT,
-        fontName="Helvetica-Bold",
-        spaceBefore=4 * mm,
-    )
-
-    # Step 4: Build the PDF content (list of elements)
-    elements = []
-
-    # --- Title ---
-    elements.append(Paragraph("POS INVOICE", title_style))
-
-    # --- Horizontal line ---
-    line_data = [["" ]]
-    line_table = Table(line_data, colWidths=[170 * mm])
-    line_table.setStyle(TableStyle([
-        ("LINEBELOW", (0, 0), (-1, 0), 1, colors.HexColor("#6366f1")),
-    ]))
-    elements.append(line_table)
-    elements.append(Spacer(1, 4 * mm))
-
-    # --- Invoice details (ID, customer, date) ---
-    elements.append(Paragraph(f"<b>Invoice ID:</b> #{invoice_id}", normal_style))
-    elements.append(Spacer(1, 2 * mm))
-    elements.append(Paragraph(f"<b>Customer:</b> {customer_name}", normal_style))
-    elements.append(Spacer(1, 2 * mm))
-    elements.append(Paragraph(f"<b>Date:</b> {created_at}", normal_style))
-    elements.append(Spacer(1, 8 * mm))
-
-    # --- Product table ---
-    # Table header row
-    table_data = [["#", "Product", "Qty", "Price", "Total"]]
-
-    # Table data rows — one row per product
-    for i, item in enumerate(items_with_totals, 1):
-        table_data.append([
-            str(i),
-            item["product_name"],
-            str(item["quantity"]),
-            f"Rs.{item['price']:.2f}",
-            f"Rs.{item['item_total']:.2f}",
-        ])
-
-    # Create the table with column widths
-    product_table = Table(
-        table_data,
-        colWidths=[12 * mm, 70 * mm, 20 * mm, 35 * mm, 35 * mm],
-    )
-
-    # Style the table (colors, borders, fonts)
-    product_table.setStyle(TableStyle([
-        # Header row styling
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#6366f1")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-        ("FONTSIZE", (0, 0), (-1, 0), 10),
-        ("ALIGN", (0, 0), (-1, 0), "CENTER"),
-        ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
-        ("TOPPADDING", (0, 0), (-1, 0), 8),
-
-        # Data rows styling
-        ("FONTNAME", (0, 1), (-1, -1), "Helvetica"),
-        ("FONTSIZE", (0, 1), (-1, -1), 9),
-        ("ALIGN", (0, 1), (0, -1), "CENTER"),   # # column centered
-        ("ALIGN", (2, 1), (2, -1), "CENTER"),   # Qty column centered
-        ("ALIGN", (3, 1), (-1, -1), "RIGHT"),   # Price & Total right-aligned
-        ("TOPPADDING", (0, 1), (-1, -1), 6),
-        ("BOTTOMPADDING", (0, 1), (-1, -1), 6),
-
-        # Alternating row colors for readability
-        *[
-            ("BACKGROUND", (0, i), (-1, i), colors.HexColor("#f0f0ff"))
-            for i in range(2, len(table_data), 2)
-        ],
-
-        # Grid lines
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cccccc")),
-        ("LINEBELOW", (0, 0), (-1, 0), 1.5, colors.HexColor("#4f46e5")),
-    ]))
-
-    elements.append(product_table)
-    elements.append(Spacer(1, 6 * mm))
-
-    # --- Grand Total ---
-    elements.append(Paragraph(f"Grand Total: Rs.{grand_total:.2f}", total_style))
-    elements.append(Spacer(1, 10 * mm))
-
-    # --- Footer line ---
-    elements.append(line_table)
-    elements.append(Spacer(1, 3 * mm))
-
-    footer_style = ParagraphStyle(
-        "Footer",
-        parent=styles["Normal"],
-        fontSize=8,
-        textColor=colors.HexColor("#999999"),
-        alignment=TA_CENTER,
-    )
-    elements.append(Paragraph("Thank you for your business!", footer_style))
-    elements.append(Paragraph("Generated by POS Invoice Generator", footer_style))
-
-    # Step 5: Build the PDF
-    doc.build(elements)
-
-    # Step 6: Reset buffer position to the beginning so it can be read
-    buffer.seek(0)
-
-    return buffer
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -378,7 +272,7 @@ def health_check():
 
 # ── Generate Invoice endpoint ──────────────────────────────────────
 @app.post("/generate-invoice")
-def generate_invoice(invoice: InvoiceRequest):
+def generate_invoice(invoice: InvoiceRequest, background_tasks: BackgroundTasks):
     """
     Create a new invoice, save to database, generate PDF, and return it.
 
@@ -417,12 +311,13 @@ def generate_invoice(invoice: InvoiceRequest):
         # Insert the invoice into the database
         cursor.execute(
             """
-            INSERT INTO pos_invoices (customer_name, items, total_amount)
-            VALUES (%s, %s, %s)
+            INSERT INTO pos_invoices (customer_name, customer_phone, items, total_amount)
+            VALUES (%s, %s, %s, %s)
             RETURNING id, created_at;
             """,
             (
                 invoice.customer_name,
+                invoice.customer_phone,
                 json.dumps(items_with_totals),
                 grand_total,
             ),
@@ -457,6 +352,7 @@ def generate_invoice(invoice: InvoiceRequest):
             items_with_totals=items_with_totals,
             grand_total=grand_total,
             created_at=date_str,
+            customer_phone=invoice.customer_phone,
         )
     except Exception as e:
         raise HTTPException(
@@ -464,13 +360,94 @@ def generate_invoice(invoice: InvoiceRequest):
             detail=f"Failed to generate PDF: {str(e)}",
         )
 
-    # ── Step 4: Return the PDF as a downloadable file ───────────────
+    # Snapshot the bytes ONCE so the same PDF can be both streamed to the
+    # merchant and uploaded to Kodryx — never regenerated.
+    pdf_bytes = pdf_buffer.getvalue()
+
+    # ── Step 4: Schedule WhatsApp delivery (fire-and-forget) ────────
+    # POS is responsible for billing + PDF only. Communication infra is
+    # delegated to Kodryx; this call runs after the HTTP response is sent
+    # and its failure can never block invoice generation or local download.
+    if invoice.send_via_whatsapp and invoice.customer_phone:
+        if KODRYX_API_URL and KODRYX_API_KEY:
+            background_tasks.add_task(
+                send_invoice_to_kodryx,
+                invoice_id=invoice_id,
+                pdf_bytes=pdf_bytes,
+                customer_name=invoice.customer_name,
+                customer_phone=invoice.customer_phone,
+                amount=grand_total,
+                db_url=DATABASE_URL,
+                kodryx_url=KODRYX_API_URL,
+                kodryx_api_key=KODRYX_API_KEY,
+            )
+        else:
+            print(
+                f"WARN: KODRYX_API_URL/KODRYX_API_KEY not set — "
+                f"WhatsApp send skipped for invoice {invoice_id}."
+            )
+
+    # ── Step 5: Return the PDF as a downloadable file ───────────────
     filename = f"invoice_{invoice_id}.pdf"
 
     return StreamingResponse(
-        pdf_buffer,
+        io.BytesIO(pdf_bytes),
         media_type="application/pdf",
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Invoice-Id": str(invoice_id),
         },
     )
+
+
+# ── Delivery status endpoint (frontend polls this) ─────────────────
+@app.get("/invoice-delivery-status/{invoice_id}")
+def get_delivery_status(invoice_id: int):
+    """
+    Return the latest Kodryx delivery state for an invoice.
+
+    Status values:
+        "not_requested" — no row (WhatsApp was not requested for this invoice)
+        "initiated"     — POS handed it to Kodryx, awaiting Kodryx response
+        "sent"          — Kodryx accepted the request (2xx)
+        "failed"        — Kodryx rejected or unreachable; merchant copy still valid
+        "skipped"       — duplicate / already-handled
+    """
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT status, response_code, error, updated_at
+              FROM kodryx_delivery_log
+             WHERE invoice_id = %s;
+            """,
+            (invoice_id,),
+        )
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to fetch delivery status: {e}",
+        )
+
+    if row is None:
+        return {
+            "invoice_id": invoice_id,
+            "status": "not_requested",
+            "response_code": None,
+            "error": None,
+            "updated_at": None,
+        }
+
+    return {
+        "invoice_id": invoice_id,
+        "status": row[0],
+        "response_code": row[1],
+        "error": row[2],
+        "updated_at": row[3].isoformat() if row[3] else None,
+    }

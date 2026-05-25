@@ -1,0 +1,11 @@
+# Claude AI files
+.claude/
+.claude-flow/
+.swarm/
+CLAUDE.md
+.mcp.json
+
+# Gemini AI files
+.gemini/
+.claude
+ruvector.db
